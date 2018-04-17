@@ -54,6 +54,7 @@ func (si *SharedInformers) startInformers(shutdown <-chan struct{}) {
 	go si.Factory.Cluster().V1alpha1().Clusters().Informer().Run(shutdown)
 	go si.Factory.Cluster().V1alpha1().Machines().Informer().Run(shutdown)
 	go si.Factory.Cluster().V1alpha1().MachineSets().Informer().Run(shutdown)
+	go si.Factory.Cluster().V1alpha1().MachineDeployments().Informer().Run(shutdown)
 }
 
 // ControllerInitArguments are arguments provided to the Init function for a new controller.
