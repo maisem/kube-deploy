@@ -19,12 +19,15 @@ package machinedeployment
 import (
 	"fmt"
 	"reflect"
+	"sort"
 
 	"github.com/golang/glog"
 	"github.com/kubernetes-incubator/apiserver-builder/pkg/builders"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/integer"
 
 	"k8s.io/kube-deploy/cluster-api/pkg/apis/cluster/common"
 	"k8s.io/kube-deploy/cluster-api/pkg/apis/cluster/v1alpha1"
@@ -75,6 +78,232 @@ func (c *MachineDeploymentControllerImpl) Init(arguments sharedinformers.Control
 	c.machineClient = mc
 }
 
+// calculateStatus calculates the latest status for the provided deployment by looking into the provided replica sets.
+func calculateStatus(allMSs []*v1alpha1.MachineSet, newMS *v1alpha1.MachineSet, md *v1alpha1.MachineDeployment) v1alpha1.MachineDeploymentStatus {
+	var (
+		availableReplicas     int32
+		totalReplicas         int32
+		totalReplicasObserved int32
+		readyReplicas         int32
+	)
+	for _, ms := range allMSs {
+		totalReplicas += *ms.Spec.Replicas
+
+		availableReplicas += ms.Status.AvailableReplicas
+		readyReplicas += ms.Status.ReadyReplicas
+		totalReplicasObserved += ms.Status.Replicas
+	}
+	unavailableReplicas := totalReplicas - availableReplicas
+	// If unavailableReplicas is negative, then that means the Deployment has more available replicas running than
+	// desired, e.g. whenever it scales down. In such a case we should simply default unavailableReplicas to zero.
+	if unavailableReplicas < 0 {
+		unavailableReplicas = 0
+	}
+
+	status := v1alpha1.MachineDeploymentStatus{
+		ObservedGeneration:  md.Generation,
+		Replicas:            totalReplicasObserved,
+		UpdatedReplicas:     newMS.Status.Replicas,
+		ReadyReplicas:       readyReplicas,
+		AvailableReplicas:   availableReplicas,
+		UnavailableReplicas: unavailableReplicas,
+	}
+
+	return status
+}
+
+func (c *MachineDeploymentControllerImpl) rolloutRolling(d *v1alpha1.MachineDeployment, msList []*v1alpha1.MachineSet) error {
+	return nil
+}
+
+func (c *MachineDeploymentControllerImpl) getAllMachineSetsAndSyncRevision(d *v1alpha1.MachineDeployment, msList []*v1alpha1.MachineSet) (*v1alpha1.MachineSet, []*v1alpha1.MachineSet, error) {
+	return nil, nil, nil
+}
+
+func (c *MachineDeploymentControllerImpl) syncDeploymentStatus(d *v1alpha1.MachineDeployment, allMSs []*v1alpha1.MachineSet, newMS *v1alpha1.MachineSet) error {
+	newStatus := calculateStatus(allMSs, newMS, d)
+
+	if reflect.DeepEqual(d.Status, newStatus) {
+		return nil
+	}
+	return nil
+}
+
+func (c *MachineDeploymentControllerImpl) getMachineSetsForDeployment(d *v1alpha1.MachineDeployment) ([]*v1alpha1.MachineSet, error) {
+	deploymentSelector, err := metav1.LabelSelectorAsSelector(&d.Spec.Selector)
+	if err != nil {
+		return nil, fmt.Errorf("deployment %s/%s has invalid label selector: %v", d.Namespace, d.Name, err)
+	}
+	return c.msLister.MachineSets(d.Namespace).List(deploymentSelector)
+}
+
+func (c *MachineDeploymentControllerImpl) scaleMachineSet(ms *v1alpha1.MachineSet, size int32) error {
+	msCopy := ms.DeepCopy()
+
+	if *(msCopy.Spec.Replicas) != size {
+		*(msCopy.Spec.Replicas) = size
+		_, err := c.machineClient.ClusterV1alpha1().MachineSets(msCopy.Namespace).Update(msCopy)
+		return err
+	}
+	return nil
+}
+
+// MachineSetsBySizeOlder sorts a list of MachineSet by size in descending order, using their creation timestamp or name as a tie breaker.
+// By using the creation timestamp, this sorts from old to new replica sets.
+type MachineSetsBySizeOlder []*v1alpha1.MachineSet
+
+func (o MachineSetsBySizeOlder) Len() int      { return len(o) }
+func (o MachineSetsBySizeOlder) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+func (o MachineSetsBySizeOlder) Less(i, j int) bool {
+	if *(o[i].Spec.Replicas) == *(o[j].Spec.Replicas) {
+		return o[i].CreationTimestamp.Before(&o[j].CreationTimestamp)
+	}
+	return *(o[i].Spec.Replicas) > *(o[j].Spec.Replicas)
+}
+
+// MachineSetsBySizeNewer sorts a list of MachineSet by size in descending order, using their creation timestamp or name as a tie breaker.
+// By using the creation timestamp, this sorts from new to old replica sets.
+type MachineSetsBySizeNewer []*v1alpha1.MachineSet
+
+func (o MachineSetsBySizeNewer) Len() int      { return len(o) }
+func (o MachineSetsBySizeNewer) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+func (o MachineSetsBySizeNewer) Less(i, j int) bool {
+	if *(o[i].Spec.Replicas) == *(o[j].Spec.Replicas) {
+		return o[j].CreationTimestamp.Before(&o[i].CreationTimestamp)
+	}
+	return *(o[i].Spec.Replicas) > *(o[j].Spec.Replicas)
+}
+
+// GetProportion will estimate the proportion for the provided replica set using 1. the current size
+// of the parent deployment, 2. the replica count that needs be added on the replica sets of the
+// deployment, and 3. the total replicas added in the replica sets of the deployment so far.
+func GetProportion(ms *v1alpha1.MachineSet, desired, surge, replicasToAdd, replicasAdded int32) int32 {
+	if ms == nil || *(ms.Spec.Replicas) == 0 || replicasToAdd == 0 || replicasToAdd == replicasAdded {
+		return int32(0)
+	}
+
+	msFraction := getMachineSetFraction(ms, desired, surge)
+	allowed := replicasToAdd - replicasAdded
+
+	if replicasToAdd > 0 {
+		// Use the minimum between the replica set fraction and the maximum allowed replicas
+		// when scaling up. This way we ensure we will not scale up more than the allowed
+		// replicas we can add.
+		return integer.Int32Min(msFraction, allowed)
+	}
+	// Use the maximum between the replica set fraction and the maximum allowed replicas
+	// when scaling down. This way we ensure we will not scale down more than the allowed
+	// replicas we can remove.
+	return integer.Int32Max(msFraction, allowed)
+}
+
+func getMachineSetFraction(ms *v1alpha1.MachineSet, desired, surge int32) int32 {
+	totalDesired := desired + surge
+	if totalDesired == 0 {
+		return -*(ms.Spec.Replicas)
+	}
+	newSize := float64(*ms.Spec.Replicas*totalDesired) / float64(surge)
+	return integer.RoundToInt32(newSize) - *(ms.Spec.Replicas)
+}
+
+func (c *MachineDeploymentControllerImpl) scale(d *v1alpha1.MachineDeployment, newMS *v1alpha1.MachineSet, oldMSs []*v1alpha1.MachineSet) error {
+	var activeMachineSets []*v1alpha1.MachineSet
+
+	if *newMS.Spec.Replicas == *d.Spec.Replicas {
+		// This means that the new machine set already has all the replicas.
+		// We should scale down all old machine sets.
+		for _, ms := range oldMSs {
+			if *ms.Spec.Replicas > 0 {
+				if err := c.scaleMachineSet(ms, 0); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if d.Spec.Strategy.Type != common.RollingUpdateMachineDeploymentStrategyType {
+		return nil
+	}
+
+	curSize := int32(0)
+	if *newMS.Spec.Replicas > 0 {
+		curSize += *newMS.Spec.Replicas
+		activeMachineSets = append(activeMachineSets, newMS)
+	}
+	for _, ms := range oldMSs {
+		if *ms.Spec.Replicas > 0 {
+			curSize += *ms.Spec.Replicas
+			activeMachineSets = append(activeMachineSets, ms)
+		}
+	}
+
+	allowedSize := int32(0)
+	maxSurge, _ := intstr.GetValueFromIntOrPercent(d.Spec.Strategy.RollingUpdate.MaxSurge, int(*d.Spec.Replicas), true)
+	if *(d.Spec.Replicas) > 0 {
+		allowedSize = *(d.Spec.Replicas) + int32(maxSurge)
+	}
+
+	delta := allowedSize - curSize
+
+	// The additional replicas should be distributed proportionally amongst the active
+	// replica sets from the larger to the smaller in size replica set. Scaling direction
+	// drives what happens in case we are trying to scale replica sets of the same size.
+	// In such a case when scaling up, we should scale up newer replica sets first, and
+	// when scaling down, we should scale down older replica sets first.
+	switch {
+	case delta > 0:
+		sort.Sort(MachineSetsBySizeNewer(activeMachineSets))
+	case delta < 0:
+		sort.Sort(MachineSetsBySizeOlder(activeMachineSets))
+	}
+
+	replicasAdded := int32(0)
+	nameToSize := make(map[string]int32)
+	for _, ms := range activeMachineSets {
+		// Estimate proportions if we have replicas to add, otherwise simply populate
+		// nameToSize with the current sizes for each replica set.
+		if delta != 0 {
+			proportion := GetProportion(ms, *d.Spec.Replicas, int32(maxSurge), delta, replicasAdded)
+
+			nameToSize[ms.Name] = *(ms.Spec.Replicas) + proportion
+			replicasAdded += proportion
+		} else {
+			nameToSize[ms.Name] = *(ms.Spec.Replicas)
+		}
+	}
+	if delta != 0 && len(activeMachineSets) > 0 {
+		ms := activeMachineSets[0]
+		leftover := delta - replicasAdded
+		nameToSize[ms.Name] = nameToSize[ms.Name] + leftover
+		if nameToSize[ms.Name] < 0 {
+			nameToSize[ms.Name] = 0
+		}
+	}
+
+	for _, ms := range activeMachineSets {
+		if err := c.scaleMachineSet(ms, nameToSize[ms.Name]); err != nil {
+			// Return as soon as we fail, the deployment is requeued
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *MachineDeploymentControllerImpl) sync(d *v1alpha1.MachineDeployment, msList []*v1alpha1.MachineSet, scale bool) error {
+	newMS, oldMSs, err := c.getAllMachineSetsAndSyncRevision(d, msList)
+	if err != nil {
+		return err
+	}
+	if scale {
+		if err := c.scale(d, newMS, oldMSs); err != nil {
+			return err
+		}
+	}
+
+	allMSs := append(oldMSs, newMS)
+	return c.syncDeploymentStatus(d, allMSs, newMS)
+}
+
 // Reconcile handles enqueued messages
 func (c *MachineDeploymentControllerImpl) Reconcile(u *v1alpha1.MachineDeployment) error {
 	// Deep-copy otherwise we are mutating our cache.
@@ -89,26 +318,17 @@ func (c *MachineDeploymentControllerImpl) Reconcile(u *v1alpha1.MachineDeploymen
 		return nil
 	}
 
-	// List ReplicaSets owned by this Deployment, while reconciling ControllerRef
-	// through adoption/orphaning.
 	msList, err := c.getMachineSetsForDeployment(d)
 	if err != nil {
 		return err
 	}
 
 	if d.DeletionTimestamp != nil {
-		return c.syncStatusOnly(d, msList)
-	}
-
-	// Update deployment conditions with an Unknown condition when pausing/resuming
-	// a deployment. In this way, we can be sure that we won't timeout when a user
-	// resumes a Deployment with a set progressDeadlineSeconds.
-	if err = c.checkPausedConditions(d); err != nil {
-		return err
+		return c.sync(d, msList, false)
 	}
 
 	if d.Spec.Paused {
-		return c.sync(d, msList)
+		return c.sync(d, msList, true)
 	}
 
 	switch d.Spec.Strategy.Type {
